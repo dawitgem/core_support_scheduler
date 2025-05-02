@@ -3,11 +3,7 @@ package com.wso2test.demo.service;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.YearMonth;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import javax.transaction.Transactional;
@@ -15,169 +11,210 @@ import javax.transaction.Transactional;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import com.wso2test.demo.model.Employee;
-import com.wso2test.demo.model.EmployeeStatus;
-import com.wso2test.demo.model.Leave;
-import com.wso2test.demo.model.LeaveStatus;
-import com.wso2test.demo.model.ShiftType;
-import com.wso2test.demo.model.SupportSchedule;
-import com.wso2test.demo.respository.EmployeeRepository;
-import com.wso2test.demo.respository.LeaveRepository;
-import com.wso2test.demo.respository.SupportScheduleRepository;
-
-import lombok.RequiredArgsConstructor;
-import lombok.var;
+import com.wso2test.demo.model.*;
+import com.wso2test.demo.respository.*;
 
 @Service
-@RequiredArgsConstructor
 @Transactional
 public class SupportSchedulerService {
-    @Autowired
-    private  EmployeeRepository employeeRepository;
 
-    @Autowired
-    private  SupportScheduleRepository supportScheduleRepository;
-
-    @Autowired
-    private  LeaveRepository leaveRepository;
-
+    @Autowired private EmployeeRepository employeeRepository;
+    @Autowired private SupportScheduleRepository supportScheduleRepository;
+    @Autowired private LeaveRepository leaveRepository;
+    @Autowired private HolidayRepository holidayRepository;
 
     // Generate the schedule for the month
-    public void generateMonthlySchedule(int year, int month) {
+    public void generateMonthlySchedule(int year, int month, List<String> excludeJuniorsFromCob) {
         YearMonth yearMonth = YearMonth.of(year, month);
-        LocalDate startDate = yearMonth.atDay(5);
-        LocalDate endDate = yearMonth.atEndOfMonth().minusDays(21);
+        LocalDate startDate = yearMonth.atDay(1);
+        LocalDate endDate = yearMonth.atEndOfMonth();
+        
 
-
-        boolean alreadyGenerated = supportScheduleRepository.existsByAssignedDateBetween(startDate, endDate);
-        if (alreadyGenerated) {
-            throw new IllegalStateException("Schedule for " + year + "-" + month + " has already been generated.");
+        // Check if the schedule already exists for this period
+        if (supportScheduleRepository.existsByAssignedDateBetween(startDate, endDate)) {
+            throw new IllegalStateException("Schedule already exists for this period.");
         }
 
+        // Get holidays for the month
+        Set<LocalDate> holidays = holidayRepository.findAll().stream()
+                .map(Holiday::getDate)
+                .collect(Collectors.toSet());
+
+        // Track unavailability and consecutive Sundays
+        Set<Long> cobUnavailable = new HashSet<>();
+        Set<Long> seniorAssignmentsTracker = new HashSet<>();
+        Set<LocalDate> systemMonitorSundaysTracker = new HashSet<>();
+
+        Map<LocalDate, List<Employee>> saturdayCobAssignments = new HashMap<>();
+
         for (LocalDate date = startDate; !date.isAfter(endDate); date = date.plusDays(1)) {
-            if (date.getDayOfWeek() != DayOfWeek.SUNDAY) {
-                generateDailySchedule(date);
+
+            // Skip holidays for shifts but not for system monitor shifts
+            if (holidays.contains(date)) continue;
+
+            boolean isSunday = date.getDayOfWeek() == DayOfWeek.SUNDAY;
+            boolean isSaturday = date.getDayOfWeek() == DayOfWeek.SATURDAY;
+
+            // Generate COB shifts first (skip Sundays)
+            if (!isSunday) {
+                List<Employee> availableForCob = getAvailableEmployees(ShiftType.COB, date, cobUnavailable);
+                
+                // Exclude juniors if the date is included in the input list
+                if (excludeJuniorsFromCob.contains(date)) {
+                    availableForCob = availableForCob.stream()
+                            .filter(e -> e.getLevel() != EmployeeLevel.JUNIOR)
+                            .collect(Collectors.toList());
+                }
+                
+                List<Employee> selectedCobEmployees = pickEmployeesForCob(availableForCob, 3);
+                for (Employee emp : selectedCobEmployees) {
+                    assignShift(date, emp, ShiftType.COB);
+                    cobUnavailable.add(emp.getId()); // Mark them unavailable for the next day
+                    assignLeaveAfterCob(emp, date.plusDays(1)); // Give them leave for the next day
+                }
+                
+            if (isSaturday) {
+                // Assign COB shifts fairly on Saturdays (round-robin or fair distribution)
+                selectedCobEmployees = pickFairCobEmployeesForSaturday(availableForCob, saturdayCobAssignments, date);
+            } else {
+                selectedCobEmployees = pickEmployeesForCob(availableForCob, 3);
+            }
+
+            for (Employee emp : selectedCobEmployees) {
+                assignShift(date, emp, ShiftType.COB);
+                cobUnavailable.add(emp.getId()); // Mark them unavailable for the next day
+                assignLeaveAfterCob(emp, date.plusDays(1)); // Give them leave for the next day
+            }
+        }
+            
+            // Generate Support shifts (must include 1 senior employee)
+            if (!isSunday) {
+                List<Employee> availableForSupport = getAvailableEmployees(ShiftType.SUPPORT, date, cobUnavailable);
+                Employee seniorSupport = getSeniorEmployeeForSupport(availableForSupport, seniorAssignmentsTracker);
+                List<Employee> selectedSupportEmployees = pickEmployeesForSupport(availableForSupport, 2);
+
+                // Ensure 1 senior and 2 juniors for Support shift
+                if (seniorSupport != null) {
+                    assignShift(date, seniorSupport, ShiftType.SUPPORT);
+                    seniorAssignmentsTracker.add(seniorSupport.getId());  // Track senior's turn
+                }
+
+                // Assign 2 juniors for the Support shift
+                for (Employee emp : selectedSupportEmployees) {
+                    assignShift(date, emp, ShiftType.SUPPORT);
+                }
+            }
+
+
+            // Generate System Monitor shifts (assigned every day)
+            if (isSunday && !systemMonitorSundaysTracker.contains(date)) {
+                List<Employee> availableForSystemMonitor = getAvailableEmployees(ShiftType.SYSTEM_MONITOR, date, cobUnavailable);
+                List<Employee> selectedSystemMonitors = pickEmployeesForSystemMonitor(availableForSystemMonitor, 1);
+                for (Employee emp : selectedSystemMonitors) {
+                    assignShift(date, emp, ShiftType.SYSTEM_MONITOR);
+                }
+                systemMonitorSundaysTracker.add(date);  // Prevent consecutive Sunday assignments
             }
         }
     }
 
-    // Generate daily schedule for each date
-    private void generateDailySchedule(LocalDate scheduleDate) {
+    // Get available employees for a shift type considering unavailability (e.g., COB yesterday)
+    private List<Employee> getAvailableEmployees(ShiftType shiftType, LocalDate date, Set<Long> unavailableEmployees) {
         List<Employee> allEmployees = employeeRepository.findAll()
                 .stream()
                 .filter(e -> e.getStatus() == EmployeeStatus.ACTIVE)
                 .collect(Collectors.toList());
 
-
-        if (allEmployees.isEmpty()) {
-            throw new RuntimeException("No active employees available.");
-        }
-
-        // Track employees who have already been assigned the shift type (Support or COB)
-        List<Employee> eligibleForSupport = filterEligibleEmployees(allEmployees, ShiftType.SUPPORT,scheduleDate);
-        List<Employee> eligibleForCob = filterEligibleEmployees(allEmployees, ShiftType.COB,scheduleDate);
-
-
-
-
-        Collections.shuffle(eligibleForSupport);
-        Collections.shuffle(eligibleForCob);
-
-        // Select employees for Support and COB shifts
-        List<Employee> selectedSupportEmployees = pickEmployees(eligibleForSupport, 2);
-        List<Employee> selectedCobEmployees = pickEmployees(eligibleForCob, 2);
-
-
-        // Assign the shifts
-        for (Employee employee : selectedSupportEmployees) {
-            assignShift(scheduleDate, employee, ShiftType.SUPPORT);
-        }
-
-        // for (Employee employee : selectedCobEmployees) {
-        //     assignShift(scheduleDate, employee, ShiftType.COB);
-
-        //     // Assign a leave day for COB employees after their shift
-        //     Leave leave = new Leave();
-        //     leave.setEmployee(employee);
-        //     employee.setStatus(EmployeeStatus.ON_LEAVE);
-        //     employeeRepository.save(employee);
-        //     leave.setStartDate(scheduleDate.plusDays(1));
-        //     leave.setEndDate(scheduleDate.plusDays(1));
-        //     leave.setStatus(LeaveStatus.APPROVED);
-        //     leave.setLeaveReason("Rest after COB shift");
-        //     leaveRepository.save(leave);
-        // }
-
-        // // Once all employees have been assigned a shift, reset their eligibility for the next round
+        // Filter employees who are available (not on leave, etc.)
+        return allEmployees.stream()
+                .filter(e -> !unavailableEmployees.contains(e.getId()))
+                .filter(e -> !hasWorkedOnPreviousDay(e, date))  // Prevent assignments if they worked previous day
+                .filter(e -> !isOnLeave(e, date))  // Skip if they are on leave
+                .collect(Collectors.toList());
     }
 
-   private List<Employee> filterEligibleEmployees(List<Employee> allEmployees, ShiftType shiftType, LocalDate scheduleDate) {
-    LocalDate startOfMonth = scheduleDate.withDayOfMonth(1);
-    LocalDate endOfMonth = scheduleDate.withDayOfMonth(scheduleDate.lengthOfMonth());
-
-    // Get all shift assignments of the month for the given shift type
-    List<SupportSchedule> currentMonthSchedules = supportScheduleRepository
-            .findByAssignedDateBetween(startOfMonth, endOfMonth)
-            .stream()
-            .filter(s -> s.getShiftType() == shiftType)
-            .collect(Collectors.toList());
-
-    // Track employees who were already assigned to this shift type
-    Set<Long> alreadyAssignedIds = currentMonthSchedules.stream()
-            .flatMap(schedule -> schedule.getEmployees().stream())
-            .map(Employee::getId)
-            .collect(Collectors.toSet());
-
-    // Find employees who haven't yet been assigned the shift
-    List<Employee> notYetAssigned = allEmployees.stream()
-            .filter(e -> !alreadyAssignedIds.contains(e.getId()))
-            .collect(Collectors.toList());
-
-    List<Employee> eligibleEmployees;
-
-    if (!notYetAssigned.isEmpty()) {
-        // Only allow employees who haven't had a turn yet
-        eligibleEmployees = notYetAssigned;
-    } else {
-        // All employees had their turn — reset and allow all
-        eligibleEmployees = allEmployees;
+    // Check if an employee worked the previous day
+    private boolean hasWorkedOnPreviousDay(Employee employee, LocalDate date) {
+        List<SupportSchedule> schedules = supportScheduleRepository.findByAssignedDateAndEmployeesId(date.minusDays(1), employee.getId());
+        return !schedules.isEmpty(); // If the employee was scheduled the day before
     }
 
-    // Avoid assigning employees who worked yesterday or the day before
-    Set<Long> recentlyWorked = new HashSet<>();
+    // Check if an employee is on leave for the specific date
+    private boolean isOnLeave(Employee employee, LocalDate date) {
+        return leaveRepository.existsByEmployeeAndStatus(employee, LeaveStatus.APPROVED) &&
+                leaveRepository.findByEmployeeIdAndStartDateLessThanEqualAndEndDateGreaterThanEqual(employee.getId(), date, date).size() > 0;
+    }
 
-    supportScheduleRepository.findByAssignedDate(scheduleDate.minusDays(1)).forEach(schedule ->
-        schedule.getEmployees().forEach(emp -> recentlyWorked.add(emp.getId()))
-    );
+    // Get the next available senior employee for the Support shift (round-robin assignment)
+    private Employee getSeniorEmployeeForSupport(List<Employee> employees, Set<Long> seniorAssignmentsTracker) {
+        // Filter seniors and return the next one in round-robin fashion
+        List<Employee> seniors = employees.stream()
+                .filter(e -> e.getLevel() == EmployeeLevel.SENIOR)
+                .collect(Collectors.toList());
 
-    supportScheduleRepository.findByAssignedDate(scheduleDate.minusDays(2)).forEach(schedule ->
-        schedule.getEmployees().forEach(emp -> recentlyWorked.add(emp.getId()))
-    );
+        if (seniors.isEmpty()) return null;  // No seniors available
 
-    // Final filtering: must not have worked recently
-    return eligibleEmployees.stream()
-            .filter(e -> !recentlyWorked.contains(e.getId()))
+        // Find the first senior who hasn't been assigned recently or is on leave
+        for (Employee senior : seniors) {
+            if (!seniorAssignmentsTracker.contains(senior.getId()) && !isOnLeave(senior, LocalDate.now())) {
+                return senior;
+            }
+        }
+        return seniors.get(0);  // If all seniors have been assigned or are on leave, reset to first senior
+    }
+
+    // Pick COB employees (3 employees, prioritize seniors)
+    private List<Employee> pickEmployeesForCob(List<Employee> availableEmployees, int desiredCount) {
+        if (availableEmployees.isEmpty()) return new ArrayList<>();
+        
+        // Prioritize COB performers for the shift
+        List<Employee> cobPerformers = availableEmployees.stream()
+                .filter(e -> e.getType() == EmployeeType.COB_PERFORMER)
+                .collect(Collectors.toList());
+        
+        return cobPerformers.size() >= desiredCount ? cobPerformers.subList(0, desiredCount) : cobPerformers;
+    }
+
+    private List<Employee> pickFairCobEmployeesForSaturday(List<Employee> availableEmployees, 
+                                                        Map<LocalDate, List<Employee>> saturdayCobAssignments, 
+                                                        LocalDate saturdayDate) {
+    // Initialize if not already tracked
+    saturdayCobAssignments.putIfAbsent(saturdayDate, new ArrayList<>());
+    
+    // Round-robin approach: get employees who haven't been assigned recently
+    List<Employee> previousSaturdays = saturdayCobAssignments.get(saturdayDate);
+    
+    // Prefer employees who haven't been assigned recently
+    List<Employee> availableForCob = availableEmployees.stream()
+            .filter(e -> !previousSaturdays.contains(e))  // Avoid employees who worked the previous Saturday
             .collect(Collectors.toList());
+
+    // Pick 3 employees for the Saturday COB shift
+    List<Employee> selectedCobEmployees = pickEmployeesForCob(availableForCob, 3);
+    
+    // Update the tracker for future Saturday assignments
+    saturdayCobAssignments.get(saturdayDate).addAll(selectedCobEmployees);
+
+    return selectedCobEmployees;
 }
-
-    
-    
-    
-
-    // Pick employees from the list for the shift
-    private List<Employee> pickEmployees(List<Employee> eligibleEmployees, int desiredCount) {
-        if (eligibleEmployees.isEmpty()) {
-            return new ArrayList<>();
-        }
-        if (eligibleEmployees.size() <= desiredCount) {
-            return new ArrayList<>(eligibleEmployees);
-        }
-        return eligibleEmployees.subList(0, desiredCount);
+    // Pick employees for Support (2 juniors)
+    private List<Employee> pickEmployeesForSupport(List<Employee> availableEmployees, int desiredCount) {
+        List<Employee> juniors = availableEmployees.stream()
+                .filter(e -> e.getLevel() == EmployeeLevel.JUNIOR)
+                .collect(Collectors.toList());
+        
+        return juniors.size() >= desiredCount ? juniors.subList(0, desiredCount) : juniors;
     }
 
-    // Assign a shift to an employee
+    // Pick employees for System Monitor shift (1 employee)
+    private List<Employee> pickEmployeesForSystemMonitor(List<Employee> availableEmployees, int desiredCount) {
+        if (availableEmployees.isEmpty()) return new ArrayList<>();
+        
+        return availableEmployees.subList(0, Math.min(availableEmployees.size(), desiredCount));
+    }
+
+    // Assign the shift to the employee
     private void assignShift(LocalDate date, Employee employee, ShiftType shiftType) {
-        // Try to find existing schedule for the date and shift type
         SupportSchedule schedule = supportScheduleRepository
                 .findByAssignedDateAndShiftType(date, shiftType)
                 .orElseGet(() -> {
@@ -186,40 +223,28 @@ public class SupportSchedulerService {
                     newSchedule.setShiftType(shiftType);
                     return newSchedule;
                 });
-    
+
         // Prevent duplicates
         if (!schedule.getEmployees().contains(employee)) {
             schedule.getEmployees().add(employee);
         }
-    
+
         if (!employee.getSupportSchedules().contains(schedule)) {
             employee.getSupportSchedules().add(schedule);
         }
-    
-        supportScheduleRepository.save(schedule); // Will also update join table
-    }
-   
 
-    // Check if all employees have been assigned a shift in the current cycle
-    public boolean allEmployeesAssigned() {
-        List<Employee> allEmployees = employeeRepository.findAll()
-                .stream()
-                .filter(e -> e.getStatus() == EmployeeStatus.ACTIVE)
-                .collect(Collectors.toList());
-    
-        YearMonth currentMonth = YearMonth.from(LocalDate.now());
-        LocalDate startOfMonth = currentMonth.atDay(1);
-        LocalDate endOfMonth = currentMonth.atEndOfMonth();
-    
-        for (Employee employee : allEmployees) {
-            List<SupportSchedule> schedules = supportScheduleRepository
-                    .findByEmployeesIdAndAssignedDateBetween(employee.getId(), startOfMonth, endOfMonth);
-    
-            if (schedules.isEmpty()) {
-                return false; // This employee has not been assigned in this cycle
-            }
-        }
-    
-        return true;
+        supportScheduleRepository.save(schedule); // Save the new or updated schedule
+    }
+
+    // Assign leave after COB shift
+    private void assignLeaveAfterCob(Employee employee, LocalDate leaveDate) {
+        Leave leave = new Leave();
+        leave.setEmployee(employee);
+        employee.setStatus(EmployeeStatus.ON_LEAVE);
+        leave.setStartDate(leaveDate);
+        leave.setEndDate(leaveDate);
+        leave.setStatus(LeaveStatus.APPROVED);
+        leave.setLeaveReason("Rest after COB shift");
+        leaveRepository.save(leave);
     }
 }

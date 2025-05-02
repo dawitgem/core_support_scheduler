@@ -9,4 +9,7 @@ public class EmployeeRequest {
    private String  email;
    private String phoneNumber;
    private EmployeeStatus status;
+   private EmployeeType type;
+   private EmployeeLevel level;
+
 }
