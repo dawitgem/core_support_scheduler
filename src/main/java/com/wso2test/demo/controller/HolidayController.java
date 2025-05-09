@@ -1,6 +1,7 @@
 package com.wso2test.demo.controller;
 
 import com.wso2test.demo.model.Holiday;
+import com.wso2test.demo.respository.HolidayRepository;
 import com.wso2test.demo.service.HolidayService;
 
 import java.time.LocalDate;
@@ -17,7 +18,8 @@ public class HolidayController {
 
     @Autowired
     private HolidayService holidayService;
-
+    @Autowired
+    private HolidayRepository holidayRepository;
     // Endpoint to add a new holiday
     @PostMapping
     public ResponseEntity<Holiday> addHoliday( @RequestBody Holiday holiday) {
@@ -40,5 +42,13 @@ public class HolidayController {
     public ResponseEntity<?> getHolidaysByDate(@PathVariable("date") String date) {
         LocalDate localDate = LocalDate.parse(date);
         return new ResponseEntity<>(holidayService.getHolidaysByDate(localDate), HttpStatus.OK);
+    }
+
+    @DeleteMapping
+    public ResponseEntity<Void> deleteAllSchedules() {
+        holidayRepository.deleteAll(); // This deletes all SupportSchedule entities
+        // If you also need to reset other data (like auto-generated leaves), do it here.
+        // e.g., leaveRepository.deleteByReason("Rest after COB shift");
+        return new ResponseEntity<>(HttpStatus.NO_CONTENT);
     }
 }

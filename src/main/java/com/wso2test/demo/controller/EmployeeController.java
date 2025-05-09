@@ -21,7 +21,6 @@ public class EmployeeController {
     private final EmployeeRepository employeeRepository;
 
 
-    @Autowired
     public EmployeeController(EmployeeService employeeService,EmployeeRepository employeeRepository) {
         this.employeeService = employeeService;
         this.employeeRepository=employeeRepository;

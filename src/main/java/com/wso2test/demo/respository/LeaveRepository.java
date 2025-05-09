@@ -11,6 +11,7 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.time.LocalDate;
+import java.util.Collection;
 import java.util.List;
 
 @Repository
@@ -40,4 +41,18 @@ public interface LeaveRepository extends JpaRepository<Leave, Long> {
     // Optional: Check if an employee is on leave on a specific date
     @Query("SELECT CASE WHEN COUNT(l) > 0 THEN true ELSE false END FROM Leave l WHERE l.employee.id = :employeeId AND :date BETWEEN l.startDate AND l.endDate AND l.status = 'APPROVED'")
     boolean isEmployeeOnLeave(@Param("employeeId") Long employeeId, @Param("date") LocalDate date);
+
+     // *** NEWLY ADDED METHOD ***
+    // Find leaves for a specific employee that start and end on the exact given dates.
+    // Useful for checking if a single-day leave record exists for a specific day.
+    List<Leave> findByEmployeeIdAndStartDateAndEndDate(Long employeeId, LocalDate startDate, LocalDate endDate);
+
+    boolean existsByEmployeeIdAndStartDateAndEndDateAndLeaveReasonAndStatusIn(
+        Long employeeId, 
+        LocalDate startDate, 
+        LocalDate endDate, 
+        String leaveReason, 
+        Collection<LeaveStatus> statuses // Use Collection for 'IN' clause
+    );
+
 }

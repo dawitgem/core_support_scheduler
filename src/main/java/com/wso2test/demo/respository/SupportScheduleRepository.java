@@ -51,4 +51,13 @@ public interface SupportScheduleRepository extends JpaRepository<SupportSchedule
     List<SupportSchedule> findJuniorInCobShiftOnDate(@Param("date") LocalDate date);
 
     List<SupportSchedule> findByAssignedDateAndEmployeesId(LocalDate assignedDate, Long employeeId);
+
+
+    @Query("SELECT s FROM SupportSchedule s JOIN s.employees e WHERE s.assignedDate = :date AND s.shiftType = :shiftType AND e.id = :employeeId")
+    Optional<SupportSchedule> findByAssignedDateAndShiftTypeAndEmployeeId(
+        @Param("date") LocalDate date,
+        @Param("shiftType") ShiftType shiftType,
+        @Param("employeeId") Long employeeId
+    );
+    
 }
